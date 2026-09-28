@@ -6,6 +6,7 @@ import ZoneMapView from '@/components/ZoneMapView.vue'
 import RidesView from '@/components/RidesView.vue'
 import VendorsView from '@/components/VendorsView.vue'
 import StaffView from '@/components/StaffView.vue'
+import ScheduleView from '@/components/ScheduleView.vue'
 import TicketView from '@/components/TicketView.vue'
 import MembersView from '@/components/MembersView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
@@ -22,6 +23,7 @@ const navs = [
   { k: 'rides', icon: '🎢', label: '游乐设施' },
   { k: 'vendors', icon: '🏪', label: '商铺' },
   { k: 'staff', icon: '👷', label: '员工管理' },
+  { k: 'schedule', icon: '🕘', label: '排班考勤' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'members', icon: '💎', label: '会员权益' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
@@ -63,6 +65,8 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.activeEvents.length">{{ store.activeEvents.length }} 个待处理事件</span>
           <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
           <span class="halo" v-if="store.maintenanceStats.queued">🛠️ {{ store.maintenanceStats.queued }} 张检修工单待接单</span>
+          <span class="halo" v-if="store.scheduleStats.checked">🕘 {{ store.scheduleStats.checked }} 人出勤中</span>
+          <span class="halo red" v-if="store.scheduleStats.pendingSwaps">🔁 {{ store.scheduleStats.pendingSwaps }} 张调班单待审批</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
         </div>
@@ -80,6 +84,7 @@ onMounted(store.refresh)
         <RidesView v-else-if="view === 'rides'" />
         <VendorsView v-else-if="view === 'vendors'" />
         <StaffView v-else-if="view === 'staff'" />
+        <ScheduleView v-else-if="view === 'schedule'" />
         <TicketView v-else-if="view === 'ticket'" />
         <MembersView v-else-if="view === 'members'" />
         <ReservationsView v-else-if="view === 'reservations'" />

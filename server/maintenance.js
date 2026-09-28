@@ -4,7 +4,7 @@ import db, { getSetting, setSetting, tx } from './db.js'
 // 停运期间复用预约模块联动退改（关时段/全额退款/投诉），完工费用记入财务流水
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 
-// 由 index.js 注入共享上下文（时钟、现金、财务流水、停运时段联动、投诉推进）
+// 由 index.js 注入共享上下文（时钟、现金、财务流水、停运时段联动、投诉推进、排班在岗/工时回写）
 const ctx = {
   day: () => num(getSetting('day'), 1),
   hour: () => num(getSetting('hour'), 9),
@@ -12,7 +12,9 @@ const ctx = {
   cash: () => num(getSetting('cash'), 0),
   logFinance: null,
   syncRideSlots: null,
-  linkComplaintsToRide: null
+  linkComplaintsToRide: null,
+  isStaffOnDuty: null,
+  addWorkMinutes: null
 }
 export function initMaintenanceContext(deps) {
   Object.assign(ctx, deps)
@@ -157,6 +159,8 @@ function completeOrder(o) {
     // 员工修好设施，满意度提升
     if (st) {
       db.prepare('UPDATE staff SET morale=? WHERE id=?').run(Math.min(100, st.morale + 3), st.id)
+      // 完工回写末段作业工时到当前考勤（满意度 +3 已由上方落库，此处不重复计）
+      ctx.addWorkMinutes?.(st.id, 60, { kind: 'maintenance_done', refId: o.id })
     }
     logOrder(o.id, 'complete',
       `${st ? st.name + ' 完成' : '完成'}检修并恢复运营，费用 ¥${o.cost.toLocaleString()} 已入账`, st?.id ?? null)
@@ -169,7 +173,7 @@ function completeOrder(o) {
   })
 }
 
-// 每游戏小时推进：在修工单累计进度；维修工离岗则退回排队；进度满自动完工
+// 每游戏小时推进：在修工单累计进度；维修工离岗则退回排队；非当班时段暂停（进度保留，上班后继续）；进度满自动完工
 // 逐单容错：一单推进/完工失败跳过本单（已回滚），不中断整批与游戏主循环
 export function processMaintenance() {
   const rows = db.prepare("SELECT * FROM maintenance_orders WHERE status='processing'").all()
@@ -182,9 +186,15 @@ export function processMaintenance() {
         logOrder(o.id, 'release', '受理维修工离岗，工单退回排队等待接续，进度保留')
         continue
       }
+      // 排班在岗门控：未处于本人考勤班次（休息/未签到/已下班）则暂停推进，进度保留；排班模块覆盖校验保证有维修岗当班
+      if (ctx.isStaffOnDuty && !ctx.isStaffOnDuty(st.id)) continue
       const progress = o.progress + repairRate(st)
       if (progress >= 100) completeOrder(o)
-      else db.prepare('UPDATE maintenance_orders SET progress=? WHERE id=?').run(Math.round(progress * 10) / 10, o.id)
+      else {
+        db.prepare('UPDATE maintenance_orders SET progress=? WHERE id=?').run(Math.round(progress * 10) / 10, o.id)
+        // 回写本时段有效作业工时（1 游戏小时）到考勤，完工结算计入工时/满意度
+        ctx.addWorkMinutes?.(st.id, 60, { kind: 'maintenance', refId: o.id })
+      }
     } catch (e) {
       console.error(`[maintenance] 工单 #${o.id} 推进失败（已回滚跳过，不影响其他工单）:`, e)
     }

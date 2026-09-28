@@ -38,6 +38,13 @@ function emptyMemberStats() {
   }
 }
 
+function emptyScheduleStats() {
+  return {
+    today: 0, checked: 0, missing: 0, pendingSwaps: 0,
+    overtimeStaff: 0, overtimeMinutes: 0, payrollToday: 0, payrollCount: 0, coverageMissing: []
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -74,7 +81,16 @@ export const useParkStore = defineStore('park', {
     memberConfig: s => s.data?.memberConfig || { enabled: true, pointRate: 1, pointsComp: 300, voucherFace: 30, benefitValidDays: 30 },
     cardProducts: s => s.data?.cardProducts || [],
     benefitProducts: s => s.data?.benefitProducts || [],
-    memberSpecialists: s => (s.data?.staff || []).filter(x => x.role === '会员专员')
+    memberSpecialists: s => (s.data?.staff || []).filter(x => x.role === '会员专员'),
+    // 员工排班与工时结算
+    shiftTypes: s => s.data?.shiftTypes || [],
+    schedules: s => s.data?.schedules || [],
+    shiftSwaps: s => s.data?.shiftSwaps || [],
+    payroll: s => s.data?.payroll || [],
+    scheduleLogs: s => s.data?.scheduleLogs || [],
+    scheduleStats: s => s.data?.scheduleStats || emptyScheduleStats(),
+    scheduleConfig: s => s.data?.scheduleConfig || { overtimeRate: 1.5, standbyRate: 0.3, lateGrace: 15, lateDeductCap: 0.2, nightAllowance: 12 },
+    pendingSwaps: s => (s.data?.shiftSwaps || []).filter(x => x.status === 'pending')
   },
   actions: {
     async refresh() {
@@ -133,6 +149,18 @@ export const useParkStore = defineStore('park', {
     saveMemberConfig(payload) { return this.api('POST', '/member-config', payload) },
     updateCardProduct(tier, payload) { return this.api('POST', `/card-products/${tier}`, payload) },
     async memberDetail(id) { return j('GET', `/members/${id}`) },
-    async memberQuote(id, payload) { return j('POST', `/members/${id}/quote`, payload) }
+    async memberQuote(id, payload) { return j('POST', `/members/${id}/quote`, payload) },
+    // 员工排班与工时结算
+    createSchedule(payload) { return this.api('POST', '/schedules', { ...payload, request_id: newRequestId() }) },
+    reassignSchedule(id, staff_id) { return this.api('POST', `/schedules/${id}/reassign`, { staff_id }) },
+    cancelSchedule(id) { return this.api('POST', `/schedules/${id}/cancel`, {}) },
+    checkIn(staff_id) { return this.api('POST', '/schedules/checkin', { staff_id, request_id: newRequestId() }) },
+    checkOut(staff_id) { return this.api('POST', '/schedules/checkout', { staff_id, request_id: newRequestId() }) },
+    requestSwap(payload) { return this.api('POST', '/shift-swaps', { ...payload, request_id: newRequestId() }) },
+    reviewSwap(id, approve, note) { return this.api('POST', `/shift-swaps/${id}/review`, { approve, note }) },
+    cancelSwap(id, staff_id) { return this.api('POST', `/shift-swaps/${id}/cancel`, { staff_id }) },
+    updateShiftType(id, payload) { return this.api('POST', `/shift-types/${id}`, payload) },
+    saveScheduleConfig(payload) { return this.api('POST', '/schedule-config', payload) },
+    async scheduleDetail(id) { return j('GET', `/schedules/${id}`) }
   }
 })

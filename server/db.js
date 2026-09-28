@@ -380,6 +380,119 @@ CREATE TABLE IF NOT EXISTS member_logs (
   staff_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mlogs_member ON member_logs(member_id);
+
+-- ---------------- 员工排班与工时结算 ----------------
+-- 班次定义（运营主管可配置：起止时刻、夜班工时/津贴；end_hour<start_hour 表示跨日夜班）
+CREATE TABLE IF NOT EXISTS shift_types (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,        -- early/mid/evening/full/night
+  name TEXT NOT NULL,               -- 早班/中班/晚班/全天班/夜班
+  start_hour INTEGER NOT NULL,
+  end_hour INTEGER NOT NULL,
+  night_hours REAL NOT NULL DEFAULT 0,  -- 该班含夜班工时（夜间执行津贴），跨日班为闭园后部分
+  active INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- 排班单（员工×日期×班次；跨日夜班归属排班当天 day；status 随调班/离岗/结算流转）
+CREATE TABLE IF NOT EXISTS schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',    -- 排班号 PB0001
+  staff_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,             -- 归属游戏日（跨日夜班为开始当天）
+  shift_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'scheduled', -- scheduled 已排班/checked 出勤中/done 已结算/missed 旷工/cancelled 已取消
+  source TEXT NOT NULL DEFAULT 'manual',    -- manual 主管排班/auto 自动铺班/swap 调班生成
+  attendance_id INTEGER,
+  payroll_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sched_day ON schedules(day);
+CREATE INDEX IF NOT EXISTS idx_sched_staff_day ON schedules(staff_id, day);
+CREATE INDEX IF NOT EXISTS idx_sched_status ON schedules(status);
+
+-- 考勤单（签到/签退、迟到、工时与加班，完工随排班结算）
+CREATE TABLE IF NOT EXISTS attendances (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id INTEGER NOT NULL,
+  staff_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,             -- 归属排班日（跨日同排班当天）
+  status TEXT NOT NULL DEFAULT 'checked_in', -- checked_in/checked_out/missing/absent
+  checkin_tick INTEGER NOT NULL DEFAULT 0,
+  checkin_day INTEGER NOT NULL DEFAULT 0,
+  checkin_hour INTEGER NOT NULL DEFAULT 0,
+  late_minutes INTEGER NOT NULL DEFAULT 0,
+  checkout_tick INTEGER NOT NULL DEFAULT 0,
+  checkout_day INTEGER NOT NULL DEFAULT 0,
+  checkout_hour INTEGER NOT NULL DEFAULT 0,
+  worked_minutes INTEGER NOT NULL DEFAULT 0, -- 实际在岗工时（含跨日，分钟）
+  work_minutes INTEGER NOT NULL DEFAULT 0,   -- 完工回写的有效作业分钟（检修/投诉处置）
+  night_minutes INTEGER NOT NULL DEFAULT 0,  -- 跨日夜班闭园后计入的夜班分钟
+  overtime_minutes INTEGER NOT NULL DEFAULT 0,
+  carried INTEGER NOT NULL DEFAULT 0,        -- 跨日：日结时已结转至次日
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_att_schedule ON attendances(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_att_staff_day ON attendances(staff_id, day);
+CREATE INDEX IF NOT EXISTS idx_att_status ON attendances(status);
+
+-- 调班申请（员工协作：员工发起 → 主管审批；审批通过原子交换两人班次）
+CREATE TABLE IF NOT EXISTS shift_swaps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',    -- 调班号 TB0001
+  schedule_id INTEGER NOT NULL,     -- 申请人原排班
+  staff_id INTEGER NOT NULL,        -- 申请人
+  target_staff_id INTEGER NOT NULL, -- 换班对象
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/rejected/cancelled
+  reviewer_id INTEGER,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  review_tick INTEGER NOT NULL DEFAULT 0,
+  review_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_swap_status ON shift_swaps(status);
+CREATE INDEX IF NOT EXISTS idx_swap_schedule ON shift_swaps(schedule_id);
+
+-- 工时工资结算（按排班逐条结算入工资财务：基本工资 + 加班费 + 夜班费，迟到/旷工扣减）
+CREATE TABLE IF NOT EXISTS payroll_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',    -- 结算单 GZ0001
+  staff_id INTEGER NOT NULL,
+  schedule_id INTEGER,
+  attendance_id INTEGER,
+  day INTEGER NOT NULL,             -- 归属排班日（跨日为开始当天，财务可按日对账）
+  kind TEXT NOT NULL DEFAULT 'shift', -- shift 班次结算/standby 待工补贴/absence 旷工
+  base_pay INTEGER NOT NULL DEFAULT 0,
+  overtime_pay INTEGER NOT NULL DEFAULT 0,
+  night_pay INTEGER NOT NULL DEFAULT 0,
+  standby_pay INTEGER NOT NULL DEFAULT 0,
+  deduction INTEGER NOT NULL DEFAULT 0, -- 迟到/旷工扣减
+  amount INTEGER NOT NULL DEFAULT 0,    -- 实发合计（计入「工资」财务流水）
+  worked_minutes INTEGER NOT NULL DEFAULT 0,
+  overtime_minutes INTEGER NOT NULL DEFAULT 0,
+  satisfaction INTEGER NOT NULL DEFAULT 0, -- 完工回写的员工满意度净变化
+  tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_payroll_day ON payroll_entries(day);
+CREATE INDEX IF NOT EXISTS idx_payroll_staff ON payroll_entries(staff_id, day);
+
+-- 排班模块时间线（排班/改派/取消/签到/迟到/签退/结转/结算/旷工/调班申请与审批）
+CREATE TABLE IF NOT EXISTS schedule_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id INTEGER,
+  staff_id INTEGER,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,   -- create/auto/reassign/cancel/checkin/late/checkout/carry/settle/missing/swap_apply/swap_approve/swap_reject/swap_cancel/leave
+  note TEXT NOT NULL DEFAULT '',
+  operator_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sched_logs_sid ON schedule_logs(schedule_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -511,6 +624,24 @@ function seed() {
   setIf('pointsComp', 300)                 // 投诉积分补偿档：结案赠送积分
   setIf('voucherFace', 30)                 // 消费券面额（¥）
   setIf('benefitValidDays', 30)            // 兑换/赠送券类权益有效期（游戏日）
+
+  // ---------- 排班与工时结算参数 ----------
+  setIf('overtimeRate', 1.5)   // 加班工资倍率（相对日薪折算时薪）
+  setIf('standbyRate', 0.3)    // 当日无排班但在岗员工的待工补贴（日薪比例）
+  setIf('lateGrace', 15)       // 签到宽限分钟，超过记迟到
+  setIf('lateDeductCap', 0.2)  // 迟到扣薪上限（日薪比例）
+  setIf('nightAllowance', 12)  // 夜班津贴（元/夜班工时）
+
+  // 默认班次（运营主管可在排班页调整）；night 为跨日夜班，闭园后 6h 计夜班工时
+  const ishift = db.prepare(`INSERT OR IGNORE INTO shift_types(code,name,start_hour,end_hour,night_hours,sort)
+      VALUES (?,?,?,?,?,?)`)
+  const shifts = [
+    ['early', '早班', 9, 14, 0, 1],
+    ['mid', '中班', 12, 18, 0, 2],
+    ['full', '全天班', 9, 18, 0, 3],
+    ['night', '夜班', 17, 9, 6, 4]
+  ]
+  shifts.forEach(s => ishift.run(...s))
 
   const ic = db.prepare(`INSERT OR IGNORE INTO card_products
       (tier,name,price,valid_days,point_mul,discount_entry,discount_ride,discount_vendor,give_ticket,give_voucher,give_fastpass,bonus_points,sort)

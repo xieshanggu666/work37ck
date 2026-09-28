@@ -10,7 +10,8 @@ const roles = [
   { k: '保安', icon: '🛡️', desc: '维护秩序，减少拥挤投诉' },
   { k: '保洁', icon: '🧹', desc: '维持区域清洁度' },
   { k: '维修', icon: '🛠️', desc: '负责设施检修' },
-  { k: '会员专员', icon: '💎', desc: '购卡接待与会员归属运营' }
+  { k: '会员专员', icon: '💎', desc: '购卡接待与会员归属运营' },
+  { k: '运营主管', icon: '🧑‍💼', desc: '排班、调班/加班审批与岗位覆盖' }
 ]
 
 const roleDesc = k => roles.find(r => r.k === k)?.desc

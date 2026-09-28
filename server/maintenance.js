@@ -4,7 +4,7 @@ import db, { getSetting, setSetting, tx } from './db.js'
 // 停运期间复用预约模块联动退改（关时段/全额退款/投诉），完工费用记入财务流水
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 
-// 由 index.js 注入共享上下文（时钟、现金、财务流水、停运时段联动、投诉推进）
+// 由 index.js 注入共享上下文（时钟、现金、财务流水、停运时段联动、投诉推进、排班在岗校验、完工回写）
 const ctx = {
   day: () => num(getSetting('day'), 1),
   hour: () => num(getSetting('hour'), 9),
@@ -12,7 +12,9 @@ const ctx = {
   cash: () => num(getSetting('cash'), 0),
   logFinance: null,
   syncRideSlots: null,
-  linkComplaintsToRide: null
+  linkComplaintsToRide: null,
+  staffDutyState: null,    // 排班模块：派工/推进前校验员工当日排班与当前在岗状态
+  onWorkComplete: null     // 排班模块：完工回写工时与满意度
 }
 export function initMaintenanceContext(deps) {
   Object.assign(ctx, deps)
@@ -83,6 +85,9 @@ export function assignMaintenanceOrder(id, staffId) {
     const ride = db.prepare('SELECT name FROM rides WHERE id=?').get(busy.ride_id)
     return { ok: false, msg: `${st.name} 正在检修「${ride?.name || '其他设施'}」，请先转派其手头工单` }
   }
+  // 排班校验：接单维修工当日必须有排班（当前未到班可先接单排队，到班打卡后才推进）
+  const duty = ctx.staffDutyState?.(st.id)
+  if (duty && !duty.scheduled) return { ok: false, code: 'NOT_SCHEDULED', msg: duty.msg || `${st.name} 今日无排班，不能承接检修工单` }
 
   const prev = o.assignee_id ? db.prepare('SELECT name FROM staff WHERE id=?').get(o.assignee_id) : null
   db.prepare("UPDATE maintenance_orders SET status='processing', assignee_id=?, start_tick=? WHERE id=?")
@@ -160,6 +165,8 @@ function completeOrder(o) {
     }
     logOrder(o.id, 'complete',
       `${st ? st.name + ' 完成' : '完成'}检修并恢复运营，费用 ¥${o.cost.toLocaleString()} 已入账`, st?.id ?? null)
+    // 完工回写排班工时模块：当值维修工本班满意度 +3（结算时落士气与工资）
+    if (st) ctx.onWorkComplete?.(st.id, 'maintenance', { code: o.code })
     // 事件中心留痕（正向小事件）
     db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
       .run(ctx.tick(), ctx.day(), 'maintenance', '设施检修完工',
@@ -182,6 +189,9 @@ export function processMaintenance() {
         logOrder(o.id, 'release', '受理维修工离岗，工单退回排队等待接续，进度保留')
         continue
       }
+      // 排班在岗校验：有排班但当前不在班（如已排晚班尚未到点）→ 工单挂起不推进，到班后自动继续
+      const duty = ctx.staffDutyState?.(st.id)
+      if (duty && !duty.onDuty) continue
       const progress = o.progress + repairRate(st)
       if (progress >= 100) completeOrder(o)
       else db.prepare('UPDATE maintenance_orders SET progress=? WHERE id=?').run(Math.round(progress * 10) / 10, o.id)

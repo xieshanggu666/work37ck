@@ -380,6 +380,106 @@ CREATE TABLE IF NOT EXISTS member_logs (
   staff_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mlogs_member ON member_logs(member_id);
+
+-- ---------------- 员工排班与工时结算 ----------------
+-- 班次模板：运营主管可配置；跨日夜班 cross_day=1（如 17:00~次日09:00）
+CREATE TABLE IF NOT EXISTS shift_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,        -- morning/mid/evening/night
+  name TEXT NOT NULL,
+  start_hour INTEGER NOT NULL,
+  end_hour INTEGER NOT NULL,
+  cross_day INTEGER NOT NULL DEFAULT 0, -- 下班是否跨到次日
+  standard_hours REAL NOT NULL DEFAULT 5, -- 结算基准工时（跨日夜班含闭园时段，按基准工时计薪）
+  color TEXT NOT NULL DEFAULT '#66a6ff',
+  active INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- 排班单：员工 × 游戏日 × 班次；status scheduled/swap/cancelled
+CREATE TABLE IF NOT EXISTS staff_schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',     -- PB0001
+  staff_id INTEGER NOT NULL,
+  shift_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,              -- 上班所属游戏日（跨日夜班归当日）
+  status TEXT NOT NULL DEFAULT 'scheduled', -- scheduled 已排 / swap 调班中 / cancelled 已取消
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+-- 同一员工同一游戏日只允许一个有效（非取消）排班
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_staff_day ON staff_schedules(staff_id,day) WHERE status<>'cancelled';
+CREATE INDEX IF NOT EXISTS idx_sched_day ON staff_schedules(day,status);
+CREATE INDEX IF NOT EXISTS idx_sched_shift ON staff_schedules(shift_id);
+
+-- 考勤工时单：上班自动生成，离岗/完工回写，下班自动结算入工资财务（跨日夜班次日闭园结算）
+CREATE TABLE IF NOT EXISTS staff_attendance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',     -- KQ0001
+  schedule_id INTEGER NOT NULL,
+  staff_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,              -- 排班所属游戏日（结算日：非跨日=当日，跨日=次日）
+  shift_id INTEGER NOT NULL,
+  cross_day INTEGER NOT NULL DEFAULT 0,
+  checkin_tick INTEGER NOT NULL DEFAULT 0,  -- 实际上班时刻（线性游戏小时）
+  checkout_tick INTEGER NOT NULL DEFAULT 0, -- 实际下班时刻；0=在岗未下班
+  work_ticks INTEGER NOT NULL DEFAULT 0,    -- 已出勤游戏小时数（随引擎每小时累计）
+  status TEXT NOT NULL DEFAULT 'checked_in', -- checked_in 在岗 / checked_out 已结算 / absent 旷工 / leave 离岗
+  late INTEGER NOT NULL DEFAULT 0,          -- 是否迟到（调班/加班后上班晚于班次开始）
+  overtime_ticks INTEGER NOT NULL DEFAULT 0,-- 已批加班小时数（1.5 倍时薪）
+  ot_approved INTEGER NOT NULL DEFAULT 0,   -- 加班申请是否已主管审批
+  leave_tick INTEGER NOT NULL DEFAULT 0,    -- 离岗时刻（非下班离岗）
+  satisfaction_delta INTEGER NOT NULL DEFAULT 0, -- 本班满意度变动（完工回写/迟到/旷工/离岗累计）
+  pay INTEGER NOT NULL DEFAULT 0,           -- 结算工资（基准工时+加班，实际进工资财务流水）
+  settle_day INTEGER NOT NULL DEFAULT 0,    -- 实际结算游戏日
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_att_sched ON staff_attendance(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_att_staff_day ON staff_attendance(staff_id,day);
+CREATE INDEX IF NOT EXISTS idx_att_status ON staff_attendance(status);
+
+-- 调班 / 加班协作申请：员工发起，运营主管审批
+CREATE TABLE IF NOT EXISTS shift_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',     -- TB0001
+  kind TEXT NOT NULL,                -- swap 调班 / overtime 加班
+  staff_id INTEGER NOT NULL,
+  schedule_id INTEGER,               -- 关联排班（调班原排班 / 加班当值排班）
+  day INTEGER NOT NULL,
+  -- 调班：目标同事与目标班次（可换日换班）；加班：当前班次延后下班时长
+  target_staff_id INTEGER,
+  target_shift_id INTEGER,
+  target_day INTEGER,
+  ot_ticks INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending 待批 / approved 已批 / rejected 驳回 / cancelled 已取消
+  approver_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  handle_tick INTEGER NOT NULL DEFAULT 0,
+  handle_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_freq_status ON shift_requests(status,kind);
+CREATE INDEX IF NOT EXISTS idx_freq_staff ON shift_requests(staff_id);
+
+-- 排班 / 考勤 / 调班全生命周期时间线
+CREATE TABLE IF NOT EXISTS shift_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id INTEGER,
+  attendance_id INTEGER,
+  request_id INTEGER,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL, -- schedule/autofill/cancel/checkin/late/leave/checkout/absent/swap_request/swap_approve/swap_reject/ot_request/ot_approve/ot_reject
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER,
+  approver_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_shiftlogs_sched ON shift_logs(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_shiftlogs_att ON shift_logs(attendance_id);
+CREATE INDEX IF NOT EXISTS idx_shiftlogs_req ON shift_logs(request_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -484,7 +584,8 @@ function seed() {
     ['陈杰', '安保', 3, 320, 1, 82, null],
     ['刘洋', '保洁', 3, 300, 1, 79, null],
     ['孙莉', '会员专员', 1, 340, 2, 90, null],
-    ['周涛', '会员专员', 1, 340, 1, 84, null]
+    ['周涛', '会员专员', 1, 340, 1, 84, null],
+    ['林岚', '运营主管', 1, 420, 2, 86, null]
   ]
   staff.forEach(s => is.run(...s))
 
@@ -532,6 +633,20 @@ function seed() {
   ]
   benefits.forEach(b => ib.run(...b))
 
+  // ---------- 排班与工时结算：班次模板（含跨日夜班，用于跨日结算） ----------
+  const ish = db.prepare(`INSERT OR IGNORE INTO shift_templates
+      (code,name,start_hour,end_hour,cross_day,standard_hours,color,sort)
+      VALUES (?,?,?,?,?,?,?,?)`)
+  const shifts = [
+    ['morning', '早班', 9, 14, 0, 5, '#66a6ff', 1],
+    ['mid', '中班', 12, 17, 0, 5, '#6dd5a0', 2],
+    ['evening', '晚班', 14, 18, 0, 4, '#a78bfa', 3],
+    ['night', '夜班', 17, 9, 1, 6, '#ff9e64', 4]   // 跨日夜班：当日 17:00 至次日 09:00
+  ]
+  shifts.forEach(s => ish.run(...s))
+  setIf('scheduleAutoFill', 1)            // 自动排班开关（引擎为未来两天无排班员工补排）
+  setIf('otRateMul', 1.5)                 // 加班时薪倍率
+
   // 示例会员（新库首日建立；含一名金卡会员便于演示等级与权益流转）
   if (db.prepare('SELECT COUNT(*) n FROM members').get().n === 0) {
     const im = db.prepare(`INSERT INTO members(code,name,phone,card_tier,status,points,total_points,balance,card_expire_day,join_day,owner_staff_id,created_tick,last_active_tick)
@@ -570,6 +685,30 @@ function seed() {
   }
 }
 seed()
+
+// ---------- 老库兼容：幂等补齐排班模块基础数据（班次模板 / 运营主管 / 模块参数） ----------
+function ensureScheduleBaseData() {
+  const hasShifts = db.prepare('SELECT COUNT(*) n FROM shift_templates').get().n
+  if (!hasShifts) {
+    const ish = db.prepare(`INSERT INTO shift_templates
+        (code,name,start_hour,end_hour,cross_day,standard_hours,color,sort)
+        VALUES (?,?,?,?,?,?,?,?)`)
+    ;[
+      ['morning', '早班', 9, 14, 0, 5, '#66a6ff', 1],
+      ['mid', '中班', 12, 17, 0, 5, '#6dd5a0', 2],
+      ['evening', '晚班', 14, 18, 0, 4, '#a78bfa', 3],
+      ['night', '夜班', 17, 9, 1, 6, '#ff9e64', 4]
+    ].forEach(s => ish.run(...s))
+  }
+  if (!db.prepare("SELECT COUNT(*) n FROM staff WHERE role='运营主管'").get().n) {
+    db.prepare('INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES(?,?,?,?,?,?,?)')
+      .run('林岚', '运营主管', 1, 420, 2, 80, 1)
+  }
+  for (const [k, v] of [['scheduleAutoFill', 1], ['otRateMul', 1.5]]) {
+    if (!getSetting(k)) setSetting(k, String(v))
+  }
+}
+ensureScheduleBaseData()
 
 export default db
 export { now, getSetting, setSetting, tx }

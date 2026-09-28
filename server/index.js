@@ -21,6 +21,15 @@ import {
   getConfig, saveConfig, updateCardProduct, memberStats, compAwardPoints,
   quoteReservation as memberQuote, onReservationBooked, onReservationRefund as onReservationRefunded
 } from './members.js'
+import {
+  initSchedulingContext, processScheduling, dayCloseSummary,
+  createSchedule, cancelSchedule, checkin as scheduleCheckin, leavePost,
+  releaseStaffSchedules, requestSwap, approveSwap, rejectSwap,
+  requestOvertime, approveOvertime, rejectOvertime, cancelRequest,
+  listSchedules, listAttendance, listRequests as listShiftRequests,
+  shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
+  listShiftTemplates
+} from './scheduling.js'
 
 const app = express()
 app.use(express.json())
@@ -76,11 +85,20 @@ initReservationContext({
   createComplaint: (payload) => createComplaint(payload)
 })
 
-// 检修工单模块共享：时钟 / 现金 / 财务流水 / 停运时段联动 / 完工联动设施类投诉
+// 检修工单模块共享：时钟 / 现金 / 财务流水 / 停运时段联动 / 完工联动设施类投诉 / 排班在岗校验 / 完工回写
 initMaintenanceContext({
   logFinance,
   syncRideSlots: (ride) => syncRideSlots(ride),
-  linkComplaintsToRide: (rideId, staffId) => linkComplaintsToRide(rideId, staffId)
+  linkComplaintsToRide: (rideId, staffId) => linkComplaintsToRide(rideId, staffId),
+  staffDutyState: (staffId) => staffDutyState(staffId),
+  onWorkComplete: (staffId, kind, meta) => writeWorkCompletion(staffId, kind, meta)
+})
+
+// 排班与工时结算模块共享：时钟 / 现金 / 财务流水 / 投诉岗位映射（用于岗位覆盖校验）
+// 惰性读取（COMPLAINT_CATS 在本文件后段定义），避免初始化时引用未声明常量
+initSchedulingContext({
+  logFinance,
+  complaintRoles: new Proxy({}, { get: (_t, cat) => COMPLAINT_CATS[cat]?.roles || [] })
 })
 
 // 会员与权益中心：时钟 / 现金 / 财务流水
@@ -351,6 +369,14 @@ function processComplaints() {
         logComplaint(c.id, 'unassign', '受理员工离岗，投诉退回待受理')
         continue
       }
+      // 排班在岗门控：当日有排班但当前不在班（未打卡/已下班）→ 处置挂起不推进，到班继续；当日无排班则退回待受理
+      const duty = staffDutyState(st.id)
+      if (!duty.scheduled) {
+        upd.run('open', c.progress, c.deadline_tick, c.severity, c.escalated, c.escalations, c.resolved_tick, c.id)
+        logComplaint(c.id, 'unassign', `${st.name} 当日无排班，投诉退回待受理`)
+        continue
+      }
+      if (!duty.onDuty) continue
       const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
       const match = !meta.roles.length || meta.roles.includes(st.role)
       const rate = (8 + st.skill * 5 + st.morale / 12) * (match ? 1.5 : 1)
@@ -410,6 +436,8 @@ function doResolveComplaint(id, compKey, auto = false) {
   db.prepare(`UPDATE complaints SET status='closed_resolved', compensation=?, comp_cost=?, rating=?, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
     .run(compKey, cost, rating, auto ? '超时未确认补偿，系统自动以真诚道歉结案' : '补偿方案确认，游客满意离园', state.tick(), state.day(), id)
   logComplaint(id, 'resolve', `${auto ? '系统自动' : '确认'}补偿「${opt.name}」${cost ? `，支出 ¥${cost}` : ''}${pointsAwarded ? `，发放 ${pointsAwarded} 积分` : ''}，游客评价 ${rating} 星`, st?.id ?? null)
+  // 完工回写排班工时模块：当值受理员工本班满意度 +2（结算时落士气与工资）
+  if (st) writeWorkCompletion(st.id, 'complaint', { code: c.code })
   return { ok: true, rating, cost, points: pointsAwarded }
 }
 
@@ -505,10 +533,17 @@ function tick() {
   let overdueIds = []
   if (hour > OPEN_HOUR + HOURS_PER_DAY - 1) {
     hour = OPEN_HOUR
-    // 日结工资
-    const wage = allStaff().filter(s => s.active).reduce((s, st) => s + st.wage, 0)
-    cash -= wage
-    logFinance(day, '工资', -wage, '当日员工工资')
+    // 日结工资：不再按在册员工发固定日薪，改为每张考勤单下班时按「基准工时+加班」逐条结算入财务流水
+    // （含跨日夜班：次日 9:00 下班，结算计入次日）；这里只做闭园汇总与旷工预警事件
+    const wageSummary = dayCloseSummary(day)
+    if (wageSummary.settledCount > 0) {
+      logFinance(day, '工资', 0, `排班工时结算汇总：${wageSummary.settledCount} 人下班/离岗结算，工资 ¥${wageSummary.totalPay}（逐条流水见当日考勤），加班 ${wageSummary.overtimeHours}h`)
+    }
+    if (wageSummary.absent > 0) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'staff', '员工旷工预警',
+          `今日有 ${wageSummary.absent} 名排班员工未打卡上班，已按旷工处理（无薪并扣减满意度）。运营主管请核查排班覆盖与人员安排。`, -1, 'active')
+    }
     // 日结租金
     const rent = allVendors().reduce((s, v) => s + v.rent, 0)
     cash -= rent
@@ -643,6 +678,10 @@ function tick() {
   for (const e of es) {
     if (e.impact && e.status === 'active') eventRepShift += (e.impact > 0 ? 0.8 : -1.6)
   }
+
+  // 排班与工时结算：自动排班、到点打卡、出勤工时累计、下班结算入工资财务（跨日夜班次日结算）
+  // 必须先于投诉/检修推进：本小时开始即打卡在岗，后续派工推进的在岗校验才放行
+  processScheduling()
 
   // 投诉处置：推进受理进度，超时自动升级 / 公开差评，返回本时段声誉扣分
   const complaintPenalty = processComplaints()
@@ -795,6 +834,18 @@ app.get('/api/state', (req, res) => {
     members: listMembers({ limit: 200 }),
     cardProducts: listCardProducts(),
     benefitProducts: listBenefitProducts(),
+    // 员工排班与工时结算
+    shifts: listShiftTemplates(),
+    schedules: listSchedules({ from: state.day(), to: state.day() + 3, limit: 600 }),
+    // 今日考勤：当日结算（含昨日上班今日下班的跨日夜班）+ 当前仍在岗
+    attendance: listAttendance({ settleDay: state.day(), limit: 200 })
+      .concat(listAttendance({ status: 'checked_in', limit: 100 }))
+      .filter((a, i, arr) => arr.findIndex(x => x.id === a.id) === i),
+    shiftRequests: listShiftRequests({ status: 'pending' }).concat(
+      listShiftRequests({ limit: 60 }).filter(r => r.status !== 'pending').slice(0, 30)
+    ),
+    schedulingStats: schedulingStats(),
+    coverageToday: coverageForDay(state.day()),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -939,12 +990,12 @@ app.delete('/api/vendors/:id', (req, res) => {
 })
 
 // ---- 员工 ----
-const ROLES = ['保安', '保洁', '维修', '会员专员']
+const ROLES = ['保安', '保洁', '维修', '会员专员', '运营主管']
 app.post('/api/staff', (req, res) => {
   const b = req.body || {}
   const role = b.role || '保安'
   if (!ROLES.includes(role)) return res.status(400).json({ ok: false, msg: '非法岗位' })
-  const wage = role === '维修' ? 380 : role === '会员专员' ? 340 : role === '保洁' ? 300 : 320
+  const wage = role === '维修' ? 380 : role === '会员专员' ? 340 : role === '运营主管' ? 420 : role === '保洁' ? 300 : 320
   const r = db.prepare('INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES(?,?,?,?,?,?,?)')
     .run(b.name || `新员工`, role, num(b.zone_id, 1), wage, 1, 80, 1)
   res.json({ ok: true, id: Number(r.lastInsertRowid) })
@@ -957,7 +1008,11 @@ app.post('/api/staff/:id', (req, res) => {
   if (b.active !== undefined) {
     db.prepare('UPDATE staff SET active=? WHERE id=?').run(b.active ? 1 : 0, id)
     // 维修工离岗：在修工单退回排队、进度保留，等待其他维修工接续
-    if (!b.active) releaseStaffOrders(id)
+    if (!b.active) {
+      releaseStaffOrders(id)
+      // 排班联动：未来排班取消、待审批调班作废、在岗考勤立即按实际工时离岗结算
+      releaseStaffSchedules(id)
+    }
   }
   if (b.assignRide) db.prepare('UPDATE staff SET assigned_ride_id=? WHERE id=?').run(num(b.assignRide), id)
   if (b.assignVendor) db.prepare('UPDATE staff SET assigned_ride_id=? WHERE id=?').run(num(b.assignVendor), id)
@@ -1102,6 +1157,9 @@ app.post('/api/complaints/:id/assign', (req, res) => {
   if (!c || !OPEN_COMPLAINT_STATUSES.includes(c.status)) return res.status(400).json({ ok: false, msg: '投诉不存在或已结案' })
   const st = db.prepare('SELECT * FROM staff WHERE id=? AND active=1').get(num(req.body?.staff_id))
   if (!st) return res.status(400).json({ ok: false, msg: '员工不存在或已离岗' })
+  // 排班校验：当日必须有排班；已排班但尚未到班也可先接单（到班打卡后开始推进）
+  const duty = staffDutyState(st.id)
+  if (!duty.scheduled) return res.status(400).json({ ok: false, code: 'NOT_SCHEDULED', msg: duty.msg || `${st.name} 今日无排班，不能受理投诉`, reqId: req.reqId })
   db.prepare("UPDATE complaints SET status='processing', assignee_id=? WHERE id=?").run(st.id, id)
   logComplaint(id, 'assign', `指派 ${st.name}（${st.role}）受理`, st.id)
   res.json({ ok: true })
@@ -1170,6 +1228,148 @@ app.post('/api/maintenance/:id/assign', (req, res) => {
 app.post('/api/maintenance/:id/cancel', (req, res) => {
   const r = cancelMaintenanceOrder(num(req.params.id))
   res.status(r.ok ? 200 : 400).json(r)
+})
+
+// ---- 员工排班与工时结算 ----
+// 班次模板 / 排班 / 考勤查询
+app.get('/api/schedules', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listSchedules({
+      day: q.day !== undefined ? num(q.day) : null,
+      staffId: q.staffId ? num(q.staffId) : null,
+      status: q.status || null,
+      limit: 600
+    }),
+    shifts: listShiftTemplates({ activeOnly: q.all === '1' ? false : true }),
+    stats: schedulingStats(),
+    coverage: coverageForDay(q.day !== undefined ? num(q.day) : state.day())
+  })
+})
+
+app.get('/api/attendance', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listAttendance({
+      day: q.day !== undefined ? num(q.day) : null,
+      staffId: q.staffId ? num(q.staffId) : null,
+      status: q.status || null,
+      settleDay: q.settleDay !== undefined ? num(q.settleDay) : null,
+      limit: 300
+    }),
+    stats: schedulingStats()
+  })
+})
+
+app.get('/api/shift-requests', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listShiftRequests({ status: q.status && q.status !== 'all' ? q.status : null, kind: q.kind || null }),
+    stats: schedulingStats()
+  })
+})
+
+// 排班时间线（排班/考勤/申请联动查询）
+app.get('/api/schedules/logs', (req, res) => {
+  const q = req.query || {}
+  res.json({ logs: shiftLogs({
+    scheduleId: q.scheduleId ? num(q.scheduleId) : null,
+    attendanceId: q.attendanceId ? num(q.attendanceId) : null,
+    requestId: q.requestId ? num(q.requestId) : null
+  }) })
+})
+
+// 运营主管排班（幂等）：返回当日岗位覆盖预警
+app.post('/api/schedules', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createSchedule({
+    staffId: num(b.staff_id),
+    shiftId: num(b.shift_id),
+    day: num(b.day, state.day()),
+    note: String(b.note || ''),
+    requestId: idemKey(req)
+  }))
+})
+
+// 取消排班（未打卡）
+app.post('/api/schedules/:id/cancel', (req, res) => {
+  reply(req, res, cancelSchedule(num(req.params.id), { requestId: idemKey(req) }))
+})
+
+// 员工/前台手动打卡（引擎也会在到点时自动打卡）
+app.post('/api/schedules/:id/checkin', (req, res) => {
+  reply(req, res, scheduleCheckin(num(req.params.id), { requestId: idemKey(req) }))
+})
+
+// 员工中途离岗：当前考勤立即按实际工时折算结算
+app.post('/api/attendance/:id/leave', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, leavePost(num(req.params.id), { reason: String(b.reason || ''), requestId: idemKey(req) }))
+})
+
+// 员工发起调班（协作，待主管审批）
+app.post('/api/schedules/:id/swap', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, requestSwap({
+    staffId: num(b.staff_id),
+    scheduleId: num(req.params.id),
+    targetStaffId: num(b.target_staff_id),
+    targetShiftId: num(b.target_shift_id),
+    targetDay: num(b.target_day),
+    reason: String(b.reason || ''),
+    requestId: idemKey(req)
+  }))
+})
+
+// 员工发起加班申请（当值，1~4h，主管审批后按 1.5 倍时薪结算）
+app.post('/api/schedules/:id/overtime', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, requestOvertime({
+    staffId: num(b.staff_id),
+    scheduleId: num(req.params.id),
+    ticks: num(b.ticks, 1),
+    reason: String(b.reason || ''),
+    requestId: idemKey(req)
+  }))
+})
+
+// 运营主管：批准 / 驳回调班
+app.post('/api/shift-requests/:id/approve', (req, res) => {
+  const id = num(req.params.id)
+  const rq = db.prepare('SELECT kind FROM shift_requests WHERE id=?').get(id)
+  if (!rq) return res.status(404).json({ ok: false, msg: '申请不存在' })
+  const approverId = num(req.body?.approver_id) || null
+  const r = rq.kind === 'swap' ? approveSwap(id, approverId) : approveOvertime(id, approverId)
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+app.post('/api/shift-requests/:id/reject', (req, res) => {
+  const id = num(req.params.id)
+  const rq = db.prepare('SELECT kind FROM shift_requests WHERE id=?').get(id)
+  if (!rq) return res.status(404).json({ ok: false, msg: '申请不存在' })
+  const approverId = num(req.body?.approver_id) || null
+  const r = rq.kind === 'swap' ? rejectSwap(id, approverId, String(req.body?.note || '')) : rejectOvertime(id, approverId, String(req.body?.note || ''))
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 员工撤回本人申请
+app.post('/api/shift-requests/:id/cancel', (req, res) => {
+  const r = cancelRequest(num(req.params.id), num(req.body?.staff_id))
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 排班运营配置：自动排班开关 / 加班倍率
+app.post('/api/schedule-config', (req, res) => {
+  const b = req.body || {}
+  if (b.auto_fill !== undefined) setSetting('scheduleAutoFill', b.auto_fill ? 1 : 0)
+  if (b.ot_rate_mul !== undefined) {
+    const v = Math.max(1, Math.min(3, num(b.ot_rate_mul, 1.5)))
+    setSetting('otRateMul', v)
+  }
+  res.json({ ok: true, config: {
+    autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
+    otRateMul: num(getSetting('otRateMul'), 1.5)
+  } })
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----
